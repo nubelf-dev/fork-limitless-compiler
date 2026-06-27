@@ -1,0 +1,332 @@
+name: Limitless Compiler v2.2 bosfix
+# linex Project
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Zip Name'
+        required: true
+        default: '4.9-kernel'
+      kernel_source:
+        description: 'Kernel Source'
+        required: true
+        default: 'https://github.com/ThRE-Team/android_kernel_xiaomi_sdm845.git'
+      kernel_branch:
+        description: 'Kernel Branch'
+        required: true
+        default: 'lineage-22.2-next'
+      defconfig:
+        description: 'defconfig'
+        required: true
+        default: 'vendor/xiaomi/mi845_defconfig'
+      ksu_url:
+        description: 'KernelSU | false for disable'
+        required: false
+        default: 'curl -LSs https://raw.githubusercontent.com/ThRE-Team/KernelSU-Next/main/kernel/setup.sh | bash -s v3.2.0'
+      clang_url:
+        description: 'Clang | false for disable'
+        required: false
+        default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-13.0.0_r81/clang-r450784d.tar.gz'
+      tweak_pre_build_cmd:
+        description: 'Tweak Pre Build'
+        required: false
+        default: 'echo "Starting kernel compilation! $(date)"'
+      tweak_after_build_cmd:
+        description: 'Tweak After Build'
+        required: false
+        default: 'echo "Compilation completed! $(date)"'
+
+jobs:
+  limitless-compiler:
+    name: ${{ github.event.inputs.zip_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Input
+        run: |
+          sudo timedatectl set-timezone Asia/Jakarta
+          echo "zip_name: ${{ github.event.inputs.zip_name }}"
+          echo "kernel_source: ${{ github.event.inputs.kernel_source }}"
+          echo "kernel_branch: ${{ github.event.inputs.kernel_branch }}"
+          echo "defconfig: ${{ github.event.inputs.defconfig }}"
+          echo "ksu_url: ${{ github.event.inputs.ksu_url }}"
+          echo "clang_url: ${{ github.event.inputs.clang_url }}"
+          echo "tweak_pre_build_cmd: ${{ github.event.inputs.tweak_pre_build_cmd }}"
+          echo "tweak_after_build_cmd: ${{ github.event.inputs.tweak_after_build_cmd }}"
+          
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc build-essential flex bison ca-certificates clang lld llvm \
+            libssl-dev libelf-dev cpio curl git unzip wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            g++-aarch64-linux-gnu g++-arm-linux-gnueabi \
+            libncurses5-dev libncursesw5-dev
+
+      - name: Setup Custom Clang Environment
+        run: |
+          download_clang() {
+            local url="$1"
+            local max_attempts=5
+            local attempt=1
+            local wait_seconds=10
+
+            while [ "$attempt" -le "$max_attempts" ]; do
+              echo "Percobaan download ke-$attempt dari $max_attempts..."
+              rm -f clang.tar.gz
+
+              # --retry: curl retry sendiri untuk error koneksi/5xx
+              # --fail: curl exit non-zero kalau HTTP status error (4xx/5xx)
+              if curl -L --retry 3 --retry-delay 5 --fail -o clang.tar.gz "$url"; then
+                FILETYPE="$(file -b clang.tar.gz)"
+                echo "Tipe file hasil download: $FILETYPE"
+                case "$FILETYPE" in
+                  *gzip*)
+                    echo "Download berhasil dan valid (gzip)."
+                    return 0
+                    ;;
+                  *)
+                    echo "File terdownload tapi BUKAN gzip (kemungkinan 503/halaman error). Isi (debug):"
+                    head -c 300 clang.tar.gz
+                    echo ""
+                    ;;
+                esac
+              else
+                echo "curl gagal (kemungkinan error jaringan atau HTTP 4xx/5xx)."
+              fi
+
+              echo "Menunggu ${wait_seconds}s sebelum retry..."
+              sleep "$wait_seconds"
+              attempt=$((attempt + 1))
+              wait_seconds=$((wait_seconds * 2))
+            done
+
+            echo "::error::Gagal download clang setelah $max_attempts percobaan. Server sumber (Gitiles) mungkin sedang gangguan (503) -- coba jalankan ulang workflow beberapa saat lagi."
+            return 1
+          }
+
+          if [ "${{ github.event.inputs.clang_url }}" == "ThRE" ]; then
+            echo "Mengunduh ThRE Weave Clang..."
+            mkdir -p ~/clang-ext
+            download_clang "${{ secrets.THRE_CLANG }}" || exit 1
+            tar -xzf clang.tar.gz -C ~/clang-ext
+          elif [ "${{ github.event.inputs.clang_url }}" != "false" ]; then
+            echo "Mengunduh Clang Kustom dari input..."
+            mkdir -p ~/clang-ext
+            download_clang "${{ github.event.inputs.clang_url }}" || exit 1
+            tar -xzf clang.tar.gz -C ~/clang-ext
+            echo "Extract selesai. Isi ~/clang-ext/bin (contoh):"
+            ls ~/clang-ext/bin | head -n10
+          else
+            echo "Menggunakan Clang bawaan sistem Ubuntu..."
+          fi
+
+      - name: Clone Kernel Source
+        run: |
+          git clone --depth=1 "${{ github.event.inputs.kernel_source }}" -b "${{ github.event.inputs.kernel_branch }}" kernel-src
+
+      - name: Fix vdso32 assembler '-EL' issue (replace /usr/bin/as)
+        run: |
+          # Masalah: clang memanggil assembler dengan PATH ABSOLUT "/usr/bin/as"
+          # (bukan dicari lewat $PATH), karena gagal menemukan toolchain arm32
+          # yang benar saat compile vdso32. /usr/bin/as adalah GNU as untuk
+          # x86_64 host, yang tidak mengenal flag '-EL' (little-endian arm32).
+          # Menambah folder baru ke $PATH TIDAK akan membantu karena clang
+          # tidak mencari "as" lewat $PATH dalam kasus ini, melainkan memanggil
+          # path absolut /usr/bin/as secara langsung.
+          #
+          # Solusi: ganti isi /usr/bin/as itu sendiri dengan wrapper pintar.
+          # Wrapper ini mengecek argumen yang diterima:
+          #   - kalau ada '-EL' atau '-mfpu'/'-mfloat-abi' (ciri-ciri target arm32)
+          #     -> teruskan ke arm-linux-gnueabi-as (assembler arm32 yang benar)
+          #   - selain itu (compile host/x86_64 normal)
+          #     -> teruskan ke /usr/bin/as.real (GNU as asli yang sudah dipindah)
+          # Dengan begini compile host & arm64 tetap memakai as asli, hanya
+          # panggilan untuk vdso32 (arm32) yang dialihkan.
+
+          REAL_ARM_AS="$(command -v arm-linux-gnueabi-as)"
+          echo "Assembler arm32 asli: $REAL_ARM_AS"
+
+          sudo cp /usr/bin/as /usr/bin/as.real
+
+          sudo tee /usr/bin/as > /dev/null << WRAPPER_EOF
+          #!/bin/bash
+          for arg in "\$@"; do
+            case "\$arg" in
+              -EL|-mfpu=*|-mfloat-abi=*|-meabi=*)
+                exec "$REAL_ARM_AS" "\$@"
+                ;;
+            esac
+          done
+          exec /usr/bin/as.real "\$@"
+          WRAPPER_EOF
+
+          sudo chmod +x /usr/bin/as
+
+          echo "Isi wrapper /usr/bin/as:"
+          cat /usr/bin/as
+
+          echo "Tes 1: panggilan biasa (harus pakai as.real / GNU as x86_64):"
+          as --version | head -n1
+
+          echo "Tes 2: panggilan dengan -EL (harus pakai arm-linux-gnueabi-as):"
+          as -EL --version | head -n1
+
+          # Jaga-jaga: clang custom (clang-ext) terkadang membawa binutils
+          # sendiri (folder bin/as) yang juga perlu dipatch dengan cara sama,
+          # karena clang bisa memilih toolchain dari direktori instalasinya
+          # sendiri alih-alih /usr/bin.
+          if [ -f "$HOME/clang-ext/bin/as" ]; then
+            echo "Ditemukan as juga di clang-ext/bin, patch juga..."
+            sudo cp "$HOME/clang-ext/bin/as" "$HOME/clang-ext/bin/as.real"
+            sudo tee "$HOME/clang-ext/bin/as" > /dev/null << WRAPPER_EOF2
+          #!/bin/bash
+          for arg in "\$@"; do
+            case "\$arg" in
+              -EL|-mfpu=*|-mfloat-abi=*|-meabi=*)
+                exec "$REAL_ARM_AS" "\$@"
+                ;;
+            esac
+          done
+          exec "$HOME/clang-ext/bin/as.real" "\$@"
+          WRAPPER_EOF2
+            sudo chmod +x "$HOME/clang-ext/bin/as"
+            echo "clang-ext/bin/as berhasil dipatch."
+          else
+            echo "Tidak ada as terpisah di clang-ext/bin, lanjut."
+          fi
+
+          # ============================================================
+          # Masalah ke-2 (muncul setelah fix as berhasil): linker /usr/bin/ld
+          # (GNU ld/BFD untuk x86_64) tidak mengenal emulasi "armelf_linux_eabi"
+          # yang dibutuhkan untuk LINK vdso32 (arm 32-bit). Errornya:
+          #   /usr/bin/ld: unrecognised emulation mode: armelf_linux_eabi
+          # Solusi: pola sama seperti fix "as" -> wrapper pintar di /usr/bin/ld
+          # yang mendeteksi argumen "-m armelf_linux_eabi" (ciri link arm32)
+          # dan meneruskan ke arm-linux-gnueabi-ld (linker arm32 yang benar).
+          # ============================================================
+
+          REAL_ARM_LD="$(command -v arm-linux-gnueabi-ld)"
+          echo "Linker arm32 asli: $REAL_ARM_LD"
+
+          sudo cp /usr/bin/ld /usr/bin/ld.real
+
+          sudo tee /usr/bin/ld > /dev/null << LDWRAPPER_EOF
+          #!/bin/bash
+          prev=""
+          for arg in "\$@"; do
+            if [ "\$prev" = "-m" ] && [[ "\$arg" == armelf* ]]; then
+              exec "$REAL_ARM_LD" "\$@"
+            fi
+            prev="\$arg"
+          done
+          exec /usr/bin/ld.real "\$@"
+          LDWRAPPER_EOF
+
+          sudo chmod +x /usr/bin/ld
+
+          echo "Isi wrapper /usr/bin/ld:"
+          cat /usr/bin/ld
+
+          echo "Tes 3: panggilan biasa ld (harus pakai ld.real / GNU ld x86_64):"
+          ld --version | head -n1
+
+          echo "Tes 4: panggilan dengan -m armelf_linux_eabi (harus pakai arm-linux-gnueabi-ld):"
+          ld -m armelf_linux_eabi --version | head -n1
+
+          # Jaga-jaga sama seperti as: cek juga ld di clang-ext/bin
+          if [ -f "$HOME/clang-ext/bin/ld" ]; then
+            echo "Ditemukan ld juga di clang-ext/bin, patch juga..."
+            sudo cp "$HOME/clang-ext/bin/ld" "$HOME/clang-ext/bin/ld.real"
+            sudo tee "$HOME/clang-ext/bin/ld" > /dev/null << LDWRAPPER_EOF2
+          #!/bin/bash
+          prev=""
+          for arg in "\$@"; do
+            if [ "\$prev" = "-m" ] && [[ "\$arg" == armelf* ]]; then
+              exec "$REAL_ARM_LD" "\$@"
+            fi
+            prev="\$arg"
+          done
+          exec "$HOME/clang-ext/bin/ld.real" "\$@"
+          LDWRAPPER_EOF2
+            sudo chmod +x "$HOME/clang-ext/bin/ld"
+            echo "clang-ext/bin/ld berhasil dipatch."
+          else
+            echo "Tidak ada ld terpisah di clang-ext/bin, lanjut."
+          fi
+
+      - name: Setup KernelSU
+        run: |
+          if [ "${{ github.event.inputs.ksu_url }}" != "false" ]; then
+            cd kernel-src
+            ${{ github.event.inputs.ksu_url }}
+          fi
+
+      - name: Compile Kernel
+        env:
+          KBUILD_BUILD_USER: "linex"
+          KBUILD_BUILD_HOST: "Project"
+        run: |
+          cd kernel-src
+          
+          OUT_DIR="out"
+          K_FLAGS="-fcommon -Qunused-arguments -Wno-everything"
+          
+          if [ "${{ github.event.inputs.clang_url }}" != "false" ]; then
+            export PATH="$HOME/clang-ext/bin:$PATH"
+          fi
+          
+          echo "Verifikasi as yang akan terpanggil lewat PATH: $(command -v as)"
+          echo "Isi /usr/bin/as saat ini:"
+          head -n3 /usr/bin/as
+          
+          MAKE_ARGS=(
+            O=$OUT_DIR
+            ARCH=arm64
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            READELF=llvm-readelf
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+          )
+          
+          mkdir -p $OUT_DIR
+          
+          make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
+          
+          ${{ github.event.inputs.tweak_pre_build_cmd }}
+          
+          ${{ secrets.TWEAK_PRE_BUILD_CMD }}
+          
+          make "${MAKE_ARGS[@]}" olddefconfig
+          
+          ${{ secrets.LIMITLESS_ADDON }}
+          
+          make -j$(nproc --all) "${MAKE_ARGS[@]}" KCFLAGS="$K_FLAGS" EXTRA_CFLAGS="$K_FLAGS"
+          
+          ${{ github.event.inputs.tweak_after_build_cmd }}
+          ${{ secrets.TWEAK_AFTER_BUILD_CMD }}
+          
+      - name: Upload Image.gz-dtb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.zip_name }}-gz-dtb
+          path: kernel-src/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: ignore
+          
+      - name: Upload Image Only
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.zip_name }}-raw
+          path: kernel-src/out/arch/arm64/boot/Image
+          if-no-files-found: ignore
